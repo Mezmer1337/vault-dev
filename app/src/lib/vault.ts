@@ -1,4 +1,4 @@
-// Всё общение с контрактом: адреса PDA, чтение состояния и три действия пользователя.
+// Всё общение с контрактом: адреса PDA, чтение состояния, действия пользователя и админа.
 import { AnchorProvider, BN, Program } from "@coral-xyz/anchor";
 import {
   createAssociatedTokenAccountIdempotentInstruction,
@@ -53,6 +53,12 @@ export interface VaultView {
   inMarket: boolean;
   pairSet: boolean;
   positionOpen: boolean;
+  vaultTokenAccountB: PublicKey;
+  feeWallet: PublicKey; // задание 1: куда идёт комиссия 1%
+  minDeposit: bigint; // задание 2
+  paused: boolean; // задание 3
+  totalFeesA: bigint; // задание 9
+  totalFeesB: bigint;
 }
 
 /** null — vault для этого токена ещё не создан. */
@@ -69,6 +75,12 @@ export async function loadVault(): Promise<VaultView | null> {
     inMarket: state.inMarket,
     pairSet: !state.tokenMintB.equals(PublicKey.default),
     positionOpen: !state.positionNftMint.equals(PublicKey.default),
+    vaultTokenAccountB: state.vaultTokenAccountB,
+    feeWallet: state.feeWallet,
+    minDeposit: toBig(state.minDeposit),
+    paused: state.paused,
+    totalFeesA: toBig(state.totalFeesA),
+    totalFeesB: toBig(state.totalFeesB),
   };
 }
 
@@ -116,12 +128,17 @@ function userAccounts(user: PublicKey) {
   };
 }
 
-/** deposit. Если у пользователя ещё нет аккаунта для shares — создаём его в той же транзакции. */
-export function deposit(wallet: BrowserWallet, amount: bigint): Promise<string> {
+/**
+ * deposit. Если у пользователя ещё нет аккаунта для shares — создаём его в той же транзакции.
+ * Задание 1: комиссия 1% идёт на ATA кошелька `feeWallet` (адрес из VaultState). Обычно он уже есть
+ * (yarn setup-demo создаёт его админу); если нет — создаём, иначе контракт не примет депозит.
+ */
+export function deposit(wallet: BrowserWallet, amount: bigint, feeWallet: PublicKey): Promise<string> {
   const accounts = userAccounts(wallet.publicKey);
+  const feeTokenAccount = getAssociatedTokenAddressSync(TOKEN_MINT, feeWallet, true);
   return getProgram(wallet)
     .methods.deposit(toBN(amount))
-    .accountsPartial(accounts)
+    .accountsPartial({ ...accounts, feeTokenAccount })
     .preInstructions([
       createAssociatedTokenAccountIdempotentInstruction(
         wallet.publicKey,
@@ -129,6 +146,7 @@ export function deposit(wallet: BrowserWallet, amount: bigint): Promise<string> 
         wallet.publicKey,
         shareMintPda
       ),
+      createAssociatedTokenAccountIdempotentInstruction(wallet.publicKey, feeTokenAccount, feeWallet, TOKEN_MINT),
     ])
     .rpc();
 }
@@ -148,4 +166,64 @@ export function withdraw(wallet: BrowserWallet, shares: bigint): Promise<string>
       ),
     ])
     .rpc();
+}
+
+/** Задание 5. withdraw_all: сжечь все shares одной инструкцией (сколько — контракт смотрит сам). */
+export function withdrawAll(wallet: BrowserWallet): Promise<string> {
+  const accounts = userAccounts(wallet.publicKey);
+  return getProgram(wallet)
+    .methods.withdrawAll()
+    .accountsPartial(accounts)
+    .preInstructions([
+      createAssociatedTokenAccountIdempotentInstruction(
+        wallet.publicKey,
+        accounts.userTokenAccount,
+        wallet.publicKey,
+        TOKEN_MINT
+      ),
+    ])
+    .rpc();
+}
+
+/** Задание 6. Закрыть карточку без shares: рента (~0.0015 SOL) вернётся на кошелёк. */
+export function closeCard(wallet: BrowserWallet): Promise<string> {
+  return getProgram(wallet)
+    .methods.closeUserCard()
+    .accountsPartial({
+      vaultState: vaultPda,
+      userCard: cardPda(wallet.publicKey),
+      userShareAccount: getAssociatedTokenAddressSync(shareMintPda, wallet.publicKey),
+      user: wallet.publicKey,
+    })
+    .rpc();
+}
+
+// ─── Действия админа (задание 11) ────────────────────────────────────────────
+
+/** sync_vault: вернуть vault в обычный режим, когда всё снова в TOKEN_A. */
+export function syncVault(wallet: BrowserWallet, vault: VaultView): Promise<string> {
+  return getProgram(wallet)
+    .methods.syncVault()
+    .accountsPartial({
+      admin: wallet.publicKey,
+      vaultState: vaultPda,
+      vaultTokenAccount: vaultTokensPda,
+      vaultTokenAccountB: vault.vaultTokenAccountB,
+    })
+    .rpc();
+}
+
+/** Задание 3 на сайте: поставить депозиты на паузу или снять паузу. */
+export function setPaused(wallet: BrowserWallet, paused: boolean): Promise<string> {
+  return getProgram(wallet)
+    .methods.setPaused(paused)
+    .accountsPartial({ admin: wallet.publicKey, vaultState: vaultPda })
+    .rpc();
+}
+
+/** Сколько TOKEN_B сейчас у vault (sync_vault требует 0). null — пара не задана. */
+export async function loadVaultTokenB(vault: VaultView): Promise<bigint | null> {
+  if (!vault.pairSet) return null;
+  const info = await connection.getTokenAccountBalance(vault.vaultTokenAccountB);
+  return BigInt(info.value.amount);
 }

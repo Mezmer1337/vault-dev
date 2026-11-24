@@ -7,6 +7,14 @@ const CONTRACT_ERRORS: Record<string, string> = {
   WithdrawTooSmall: "Слишком мало shares: за них не выйдет ни одного токена.",
   MathOverflow: "Слишком большая сумма.",
   InMarket: "Деньги vault сейчас в рынке. Внесение и вывод откроются, когда админ вызовет sync_vault.",
+  DepositTooSmall: "Сумма меньше минимального депозита vault.",
+  VaultPaused: "Админ поставил депозиты на паузу. Вывод при этом работает.",
+  CardHasShares: "На карточке ещё есть shares — сначала выведите их.",
+  Unauthorized: "Это действие доступно только админу vault.",
+  PairNotSet: "У vault не задана пара TOKEN_B.",
+  PositionOpen: "Позиция Raydium ещё открыта: сначала close_position.",
+  TokenBNotZero: "У vault ещё есть TOKEN_B: сначала обменяйте его обратно в TOKEN_A.",
+  ConstraintTokenOwner: "Неверный токен-аккаунт для комиссии: обновите страницу (мог смениться fee_wallet).",
   AccountNotInitialized: "Нужный аккаунт ещё не создан (карточка или токен-аккаунт). Обновите страницу и проверьте шаги.",
 };
 

@@ -244,6 +244,92 @@ export type SimpleVault = {
       ]
     },
     {
+      "name": "closeUserCard",
+      "docs": [
+        "Задание 6. Закрыть карточку, когда shares не осталось: рента возвращается пользователю.",
+        "Проверку shares делает `constraint` в `CloseUserCard`, закрытие — `close = user`."
+      ],
+      "discriminator": [
+        48,
+        156,
+        133,
+        38,
+        191,
+        116,
+        165,
+        94
+      ],
+      "accounts": [
+        {
+          "name": "vaultState",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  118,
+                  97,
+                  117,
+                  108,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "vault_state.token_mint",
+                "account": "vaultState"
+              }
+            ]
+          }
+        },
+        {
+          "name": "userCard",
+          "docs": [
+            "Карточка закрывается, рента уходит владельцу"
+          ],
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  117,
+                  115,
+                  101,
+                  114,
+                  95,
+                  99,
+                  97,
+                  114,
+                  100
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "vaultState"
+              },
+              {
+                "kind": "account",
+                "path": "user"
+              }
+            ]
+          }
+        },
+        {
+          "name": "userShareAccount",
+          "docs": [
+            "Share-аккаунт пользователя: на нём тоже должно быть 0 shares"
+          ]
+        },
+        {
+          "name": "user",
+          "writable": true,
+          "signer": true
+        }
+      ],
+      "args": []
+    },
+    {
       "name": "collectFees",
       "docs": [
         "Неделя 13. Админ забирает накопленные комиссии позиции в vault."
@@ -451,9 +537,10 @@ export type SimpleVault = {
       "docs": [
         "Пользователь вносит `amount` токенов → получает share-токены.",
         "",
-        "Формула:",
-        "Первый депозит:       shares = amount  (1:1)",
-        "Последующие депозиты: shares = amount * total_shares / total_tokens"
+        "Комиссия 1% (задание 1) уходит на `fee_wallet`, shares считаются от остатка `net`:",
+        "net = amount - amount * 1%",
+        "Первый депозит:       shares = net  (1:1)",
+        "Последующие депозиты: shares = net * total_shares / total_tokens"
       ],
       "discriminator": [
         242,
@@ -601,6 +688,13 @@ export type SimpleVault = {
           "writable": true
         },
         {
+          "name": "feeTokenAccount",
+          "docs": [
+            "Задание 1: токен-аккаунт fee_wallet (куда идёт комиссия 1%)"
+          ],
+          "writable": true
+        },
+        {
           "name": "user",
           "writable": true,
           "signer": true
@@ -614,6 +708,138 @@ export type SimpleVault = {
         {
           "name": "amount",
           "type": "u64"
+        }
+      ]
+    },
+    {
+      "name": "increaseLiquidity",
+      "docs": [
+        "Задание 8. Админ докладывает токены vault в уже открытую позицию."
+      ],
+      "discriminator": [
+        46,
+        156,
+        243,
+        118,
+        13,
+        205,
+        251,
+        178
+      ],
+      "accounts": [
+        {
+          "name": "admin",
+          "docs": [
+            "mut: при close_position админу возвращается рента, которую он платил в open_position"
+          ],
+          "writable": true,
+          "signer": true,
+          "relations": [
+            "vaultState"
+          ]
+        },
+        {
+          "name": "vaultState",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  118,
+                  97,
+                  117,
+                  108,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "vault_state.token_mint",
+                "account": "vaultState"
+              }
+            ]
+          }
+        },
+        {
+          "name": "vaultTokenAccount",
+          "writable": true
+        },
+        {
+          "name": "vaultTokenAccountB",
+          "writable": true
+        },
+        {
+          "name": "poolState",
+          "writable": true
+        },
+        {
+          "name": "positionNftMint",
+          "writable": true
+        },
+        {
+          "name": "positionNftAccount",
+          "writable": true
+        },
+        {
+          "name": "personalPosition",
+          "writable": true
+        },
+        {
+          "name": "tokenVault0",
+          "writable": true
+        },
+        {
+          "name": "tokenVault1",
+          "writable": true
+        },
+        {
+          "name": "tickArrayLower",
+          "writable": true
+        },
+        {
+          "name": "tickArrayUpper",
+          "writable": true
+        },
+        {
+          "name": "vault0Mint"
+        },
+        {
+          "name": "vault1Mint"
+        },
+        {
+          "name": "clmmProgram",
+          "address": "DRayAUgENGQBKVaX8owNhgzkEDyoHTGVEGHVJT1E9pfH"
+        },
+        {
+          "name": "tokenProgram",
+          "address": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+        },
+        {
+          "name": "tokenProgram2022",
+          "address": "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
+        },
+        {
+          "name": "memoProgram",
+          "address": "MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr"
+        },
+        {
+          "name": "systemProgram",
+          "address": "11111111111111111111111111111111"
+        }
+      ],
+      "args": [
+        {
+          "name": "amount0Max",
+          "type": "u64"
+        },
+        {
+          "name": "amount1Max",
+          "type": "u64"
+        },
+        {
+          "name": "base0",
+          "type": "bool"
         }
       ]
     },
@@ -899,6 +1125,115 @@ export type SimpleVault = {
         },
         {
           "name": "base0",
+          "type": "bool"
+        }
+      ]
+    },
+    {
+      "name": "setFeeWallet",
+      "docs": [
+        "Задание 1. Админ меняет кошелёк, на который идёт комиссия 1%."
+      ],
+      "discriminator": [
+        108,
+        242,
+        79,
+        79,
+        203,
+        119,
+        109,
+        211
+      ],
+      "accounts": [
+        {
+          "name": "admin",
+          "signer": true,
+          "relations": [
+            "vaultState"
+          ]
+        },
+        {
+          "name": "vaultState",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  118,
+                  97,
+                  117,
+                  108,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "vault_state.token_mint",
+                "account": "vaultState"
+              }
+            ]
+          }
+        }
+      ],
+      "args": [
+        {
+          "name": "feeWallet",
+          "type": "pubkey"
+        }
+      ]
+    },
+    {
+      "name": "setPaused",
+      "docs": [
+        "Задание 3. Админ ставит депозиты на паузу (paused = true) или снимает паузу.",
+        "Вывод на паузе остаётся доступен: пользователь всегда может забрать свои деньги."
+      ],
+      "discriminator": [
+        91,
+        60,
+        125,
+        192,
+        176,
+        225,
+        166,
+        218
+      ],
+      "accounts": [
+        {
+          "name": "admin",
+          "signer": true,
+          "relations": [
+            "vaultState"
+          ]
+        },
+        {
+          "name": "vaultState",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  118,
+                  97,
+                  117,
+                  108,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "vault_state.token_mint",
+                "account": "vaultState"
+              }
+            ]
+          }
+        }
+      ],
+      "args": [
+        {
+          "name": "paused",
           "type": "bool"
         }
       ]
@@ -1243,6 +1578,169 @@ export type SimpleVault = {
           "type": "u64"
         }
       ]
+    },
+    {
+      "name": "withdrawAll",
+      "docs": [
+        "Задание 5. Сжечь все shares пользователя за один вызов.",
+        "Сколько их — берём из share-аккаунта на цепочке, а не с клиента."
+      ],
+      "discriminator": [
+        96,
+        246,
+        166,
+        130,
+        229,
+        50,
+        43,
+        70
+      ],
+      "accounts": [
+        {
+          "name": "vaultState",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  118,
+                  97,
+                  117,
+                  108,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "vault_state.token_mint",
+                "account": "vaultState"
+              }
+            ]
+          }
+        },
+        {
+          "name": "userCard",
+          "docs": [
+            "Карточка пользователя — вывод возможен только с карточкой"
+          ],
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  117,
+                  115,
+                  101,
+                  114,
+                  95,
+                  99,
+                  97,
+                  114,
+                  100
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "vaultState"
+              },
+              {
+                "kind": "account",
+                "path": "user"
+              }
+            ]
+          }
+        },
+        {
+          "name": "vaultTokenAccount",
+          "docs": [
+            "Токен-аккаунт vault — отправляет токены пользователю"
+          ],
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  118,
+                  97,
+                  117,
+                  108,
+                  116,
+                  95,
+                  116,
+                  111,
+                  107,
+                  101,
+                  110,
+                  115
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "vault_state.token_mint",
+                "account": "vaultState"
+              }
+            ]
+          }
+        },
+        {
+          "name": "shareMint",
+          "docs": [
+            "Share mint — тут сжигаются shares"
+          ],
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  115,
+                  104,
+                  97,
+                  114,
+                  101,
+                  95,
+                  109,
+                  105,
+                  110,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "vault_state.token_mint",
+                "account": "vaultState"
+              }
+            ]
+          }
+        },
+        {
+          "name": "userTokenAccount",
+          "docs": [
+            "Токен-аккаунт пользователя (куда придут токены)"
+          ],
+          "writable": true
+        },
+        {
+          "name": "userShareAccount",
+          "docs": [
+            "Share-аккаунт пользователя (откуда сжигаем shares)"
+          ],
+          "writable": true
+        },
+        {
+          "name": "user",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "tokenProgram",
+          "address": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+        }
+      ],
+      "args": []
     }
   ],
   "accounts": [
@@ -1374,6 +1872,26 @@ export type SimpleVault = {
       "code": 6014,
       "name": "tokenBNotZero",
       "msg": "Cannot sync: vault still holds TOKEN_B, swap it back to TOKEN_A first"
+    },
+    {
+      "code": 6015,
+      "name": "depositTooSmall",
+      "msg": "Deposit is below the vault minimum"
+    },
+    {
+      "code": 6016,
+      "name": "vaultPaused",
+      "msg": "Deposits are paused by admin"
+    },
+    {
+      "code": 6017,
+      "name": "cardHasShares",
+      "msg": "User still has shares: withdraw them before closing the card"
+    },
+    {
+      "code": 6018,
+      "name": "swapTooLarge",
+      "msg": "Swap too large: at most 50% of vault TOKEN_A per swap"
     }
   ],
   "types": [
@@ -1924,6 +2442,26 @@ export type SimpleVault = {
           {
             "name": "inMarket",
             "type": "bool"
+          },
+          {
+            "name": "feeWallet",
+            "type": "pubkey"
+          },
+          {
+            "name": "minDeposit",
+            "type": "u64"
+          },
+          {
+            "name": "paused",
+            "type": "bool"
+          },
+          {
+            "name": "totalFeesA",
+            "type": "u64"
+          },
+          {
+            "name": "totalFeesB",
+            "type": "u64"
           }
         ]
       }

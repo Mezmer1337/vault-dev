@@ -12,3 +12,16 @@ export function previewWithdraw(shares: bigint, totalTokens: bigint, totalShares
   if (totalShares === 0n) return 0n;
   return (shares * totalTokens) / totalShares;
 }
+
+// Задание 1: комиссия 1% с депозита — та же формула, что deposit_fee в lib.rs
+export const DEPOSIT_FEE_BPS = 100n;
+
+/** Комиссия с суммы депозита (округление вниз). */
+export function depositFee(amount: bigint): bigint {
+  return (amount * DEPOSIT_FEE_BPS) / 10_000n;
+}
+
+/** deposit с комиссией: shares считаются от суммы за вычетом 1%. */
+export function previewDepositShares(amount: bigint, totalTokens: bigint, totalShares: bigint): bigint {
+  return previewShares(amount - depositFee(amount), totalTokens, totalShares);
+}

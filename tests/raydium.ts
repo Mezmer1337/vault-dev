@@ -8,6 +8,8 @@
  *
  * Неделя 12: add_pair_token, swap 300 A → B, пауза deposit/withdraw, отказы (не админ, slippage, чужой пул)
  * Неделя 13: позиция, комиссии, закрытие (рента возвращается админу), отказы
+ * Задания: 7 — swap A → B не больше 50% TOKEN_A; 8 — increase_liquidity; 9 — total_fees_a / total_fees_b
+ * Задание 1: с депозита 1000 TOKEN_A 1% уходит админу (fee_wallet), в vault ложится 990
  * Финал: swap всего B → A + sync_vault одной транзакцией (даже если кто-то докинул B), вывод пользователя
  * Второй vault (на TOKEN_B): позиция без swap тоже ставит in_market; sync_vault с позицией → PositionOpen
  */
@@ -56,6 +58,7 @@ const MEMO_PROGRAM_ID = new PublicKey("MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfc
 const UNIT = 1_000_000; // decimals = 6
 const TICK_SPACING = 60;
 const U64_MAX = new BN("18446744073709551615"); // swap: «весь баланс»
+const IN_VAULT = 990 * UNIT; // депозит 1000 минус комиссия 1% (задание 1)
 
 /** Аккаунты одного vault, нужные Raydium-инструкциям */
 interface VaultCtx {
@@ -275,6 +278,15 @@ describe("simple_vault + Raydium CLMM (недели 12–13)", () => {
       .preInstructions([cu])
       .signers(opts.signer ? [opts.signer] : []);
 
+  /** Задание 8. Builder для vault::increase_liquidity (суммы — в порядке токенов пула) */
+  const increaseLiquidity = async (v: VaultCtx, p: PositionCtx, amount0: BN, amount1: BN, base0: boolean, opts: { signer?: Keypair } = {}) =>
+    program.methods
+      .increaseLiquidity(amount0, amount1, base0)
+      .accounts((await positionAccounts(v, p, opts)) as any)
+      .remainingAccounts([writable(exBitmap())])
+      .preInstructions([cu])
+      .signers(opts.signer ? [opts.signer] : []);
+
   // Обмен кошельком admin (не vault) — чтобы в пуле шла торговля и капали комиссии
   const walletSwap = async (inputMint: PublicKey, amountIn: BN) => {
     const { info, poolKeys, computePoolInfo, res } = await quote(inputMint, amountIn);
@@ -326,6 +338,8 @@ describe("simple_vault + Raydium CLMM (недели 12–13)", () => {
         userTokenAccount: userTokenA,
         userShareAccount: userShares,
         user: user.publicKey,
+        // задание 1: комиссия депозита идёт на fee_wallet = admin
+        ...(method === "deposit" ? { feeTokenAccount: adminAta(tokenA) } : {}),
       })
       .signers([user])
       .rpc();
@@ -454,7 +468,22 @@ describe("simple_vault + Raydium CLMM (недели 12–13)", () => {
   it("swap: min_amount_out выше реального выхода — откат", async () => {
     // 10 A по цене ~1 дают чуть меньше 10 B (комиссия 0.25%) — просим ровно 10 B
     await expectError(async () => (await vaultSwap(vault, new BN(10 * UNIT), new BN(10 * UNIT), true)).rpc(), "TooLittleOutputReceived");
-    assert.equal(await balance(vault.accA), BigInt(1000 * UNIT));
+    assert.equal(await balance(vault.accA), BigInt(IN_VAULT));
+    assert.isFalse((await fetchVault(vault.state)).inMarket);
+  });
+
+  it("задание 7. swap A → B больше 50% TOKEN_A vault — ошибка SwapTooLarge", async () => {
+    // в vault 990 A: 495 — ровно половина (можно), 495.000001 — уже нельзя
+    await expectError(
+      async () => (await vaultSwap(vault, new BN(IN_VAULT / 2 + 1), new BN(0), true)).rpc(),
+      "SwapTooLarge"
+    );
+    // «весь баланс» A → B тоже больше половины
+    await expectError(
+      async () => (await vaultSwap(vault, U64_MAX, new BN(0), true, { quoteAmount: new BN(IN_VAULT) })).rpc(),
+      "SwapTooLarge"
+    );
+    assert.equal(await balance(vault.accA), BigInt(IN_VAULT));
     assert.isFalse((await fetchVault(vault.state)).inMarket);
   });
 
@@ -462,13 +491,13 @@ describe("simple_vault + Raydium CLMM (недели 12–13)", () => {
     const { res } = await quote(tokenA, new BN(300 * UNIT));
     await (await vaultSwap(vault, new BN(300 * UNIT), res.minAmountOut.amount.raw, true)).rpc();
 
-    assert.equal(await balance(vault.accA), BigInt(700 * UNIT));
+    assert.equal(await balance(vault.accA), BigInt(IN_VAULT - 300 * UNIT));
     const b = await balance(vault.accB);
     assert.isTrue(b > BigInt(290 * UNIT) && b < BigInt(300 * UNIT), `B после обмена: ${b}`);
 
     const state = await fetchVault(vault.state);
     assert.isTrue(state.inMarket);
-    assert.equal(state.totalTokens.toNumber(), 1000 * UNIT); // учёт заморожен до sync_vault
+    assert.equal(state.totalTokens.toNumber(), IN_VAULT); // учёт заморожен до sync_vault
   });
 
   it("deposit и withdraw на паузе, пока деньги в рынке", async () => {
@@ -537,6 +566,40 @@ describe("simple_vault + Raydium CLMM (недели 12–13)", () => {
     await expectError(async () => (await openPosition(vault, p, new BN(UNIT), new BN(UNIT), true)).rpc(), "PositionAlreadyOpen");
   });
 
+  it("задание 8. increase_liquidity: не админ — ошибка", async () => {
+    await expectError(async () => (await increaseLiquidity(vault, position, new BN(UNIT), new BN(UNIT), true, { signer: user })).rpc(), "Unauthorized");
+  });
+
+  it("задание 8. increase_liquidity: vault докладывает токены в открытую позицию", async () => {
+    const { poolInfo: info } = await poolInfo();
+    const aIsToken0 = info.mintA.address === tokenA.toBase58();
+    const aBefore = await balance(vault.accA);
+    const bBefore = await balance(vault.accB);
+    const liquidityBefore = await positionLiquidity(position.nft.publicKey);
+
+    // base = token_0, докладываем 20; второго — сколько потребуется, но не больше, чем есть у vault
+    const amount1Max = new BN((aIsToken0 ? bBefore : aBefore).toString());
+    await (await increaseLiquidity(vault, position, new BN(20 * UNIT), amount1Max, true)).rpc();
+
+    const liquidityAfter = await positionLiquidity(position.nft.publicKey);
+    assert.isTrue(liquidityAfter.gt(liquidityBefore), `ликвидность ${liquidityBefore} → ${liquidityAfter}`);
+
+    const spentA = aBefore - (await balance(vault.accA));
+    const spentB = bBefore - (await balance(vault.accB));
+    const spent0 = aIsToken0 ? spentA : spentB;
+    assert.isTrue(spent0 > BigInt(0) && spent0 <= BigInt(20 * UNIT), `token_0 потрачено: ${spent0}`);
+    assert.isTrue((aIsToken0 ? spentB : spentA) > BigInt(0), "token_1 тоже потрачен (позиция в диапазоне)");
+
+    // NFT позиции так же у vault, вторая позиция не появилась
+    const state = await fetchVault(vault.state);
+    assert.equal(state.positionNftMint.toBase58(), position.nft.publicKey.toBase58());
+    assert.isTrue(state.inMarket);
+  });
+
+  it("задание 8. increase_liquidity: обе суммы 0 — ZeroAmount", async () => {
+    await expectError(async () => (await increaseLiquidity(vault, position, new BN(0), new BN(0), true)).rpc(), "ZeroAmount");
+  });
+
   it("collect_fees / close_position: не админ — ошибка", async () => {
     await expectError(async () => (await collectFees(vault, position, { signer: user })).rpc(), "Unauthorized");
     await expectError(async () => (await closePosition(vault, position, { signer: user })).rpc(), "Unauthorized");
@@ -558,6 +621,9 @@ describe("simple_vault + Raydium CLMM (недели 12–13)", () => {
     const bBefore = await balance(vault.accB);
     const liquidityBefore = await positionLiquidity(position.nft.publicKey);
     assert.isTrue(liquidityBefore.gtn(0));
+    const feesBefore = await fetchVault(vault.state);
+    assert.equal(feesBefore.totalFeesA.toNumber(), 0);
+    assert.equal(feesBefore.totalFeesB.toNumber(), 0);
 
     await (await collectFees(vault, position)).rpc();
 
@@ -569,14 +635,24 @@ describe("simple_vault + Raydium CLMM (недели 12–13)", () => {
     assert.isTrue(gainA > BigInt(0) && gainA < BigInt(10 * UNIT), `комиссия в TOKEN_A: ${gainA}`);
     assert.isTrue(gainB > BigInt(0) && gainB < BigInt(10 * UNIT), `комиссия в TOKEN_B: ${gainB}`);
 
+    // Задание 9: счётчики комиссий в VaultState равны тому, что пришло на балансы
+    const afterState = await fetchVault(vault.state);
+    assert.equal(afterState.totalFeesA.toString(), gainA.toString());
+    assert.equal(afterState.totalFeesB.toString(), gainB.toString());
+
     // Ликвидность позиции не тронута
     assert.equal((await positionLiquidity(position.nft.publicKey)).toString(), liquidityBefore.toString());
     assert.equal((await fetchVault(vault.state)).positionNftMint.toBase58(), position.nft.publicKey.toBase58());
   });
 
   it("close_position: ликвидность возвращается в vault, рента — админу", async () => {
+    // Ещё немного торговли — к закрытию накопятся новые комиссии
+    await walletSwap(tokenA, new BN(500 * UNIT));
+    await walletSwap(tokenB, new BN(500 * UNIT));
+
     const aBefore = await balance(vault.accA);
     const bBefore = await balance(vault.accB);
+    const feesBefore = await fetchVault(vault.state);
 
     await (await closePosition(vault, position)).rpc();
 
@@ -592,6 +668,13 @@ describe("simple_vault + Raydium CLMM (недели 12–13)", () => {
     const state = await fetchVault(vault.state);
     assert.equal(state.positionNftMint.toBase58(), PublicKey.default.toBase58());
     assert.isTrue(state.inMarket, "пока есть TOKEN_B, vault всё ещё в рынке");
+
+    // Задание 9: close_position тоже считает комиссии (отдельно от вернувшейся ликвидности)
+    assert.isTrue(state.totalFeesA.gt(feesBefore.totalFeesA), "total_fees_a вырос при закрытии");
+    assert.isTrue(state.totalFeesB.gt(feesBefore.totalFeesB), "total_fees_b вырос при закрытии");
+    // а ликвидность (~200 токенов) в счётчик не попала
+    assert.isTrue(state.totalFeesA.lt(new BN(10 * UNIT)) && state.totalFeesB.lt(new BN(10 * UNIT)));
+    console.log(`  Комиссий за всё время: A ${state.totalFeesA}, B ${state.totalFeesB}`);
   });
 
   // ─── финал: всё обратно в A ────────────────────────────────────────────────
@@ -613,15 +696,15 @@ describe("simple_vault + Raydium CLMM (недели 12–13)", () => {
     const realA = await balance(vault.accA);
     assert.isFalse(state.inMarket);
     assert.equal(state.totalTokens.toString(), realA.toString());
-    assert.notEqual(state.totalTokens.toNumber(), 1000 * UNIT, "после обменов и комиссий сумма должна измениться");
-    console.log(`  total_tokens: 1000 → ${Number(realA) / UNIT}`);
+    assert.notEqual(state.totalTokens.toNumber(), IN_VAULT, "после обменов и комиссий сумма должна измениться");
+    console.log(`  total_tokens: ${IN_VAULT / UNIT} → ${Number(realA) / UNIT}`);
   });
 
   it("withdraw: пользователь выводит все shares и получает весь TOKEN_A vault", async () => {
     const before = await balance(userTokenA);
     const vaultA = await balance(vault.accA);
 
-    await depositOrWithdraw("withdraw", 1000 * UNIT);
+    await depositOrWithdraw("withdraw", IN_VAULT); // shares = 990 (депозит 1000 минус комиссия)
 
     assert.equal((await balance(userTokenA)) - before, vaultA);
     assert.equal(await balance(userShares), BigInt(0));

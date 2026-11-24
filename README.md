@@ -367,8 +367,8 @@ yarn sync-idl     # скопировать новый IDL в app/src/idl/
 ### Ограничения MVP
 
 - Только devnet и один vault (тот, что в `vault-config.json`).
-- Кнопок админа (swap, позиция, `sync_vault`) на сайте нет.
-- Данные обновляются после каждого действия и раз в 20 секунд, без подписки на изменения.
+- Swap и позицию Raydium админ делает скриптами; `sync_vault` и пауза депозитов — в панели админа (задание 11).
+- ~~Данные обновляются раз в 20 секунд~~ — теперь через подписки `onAccountChange` (задание 12).
 - Пока vault в рынке, «цена 1 share» — это цена до выхода в рынок: `total_tokens` обновляется только на `sync_vault`.
 
 ---
@@ -576,3 +576,34 @@ vault-simple/
 10. *(нед. 14)* Показать на сайте историю своих депозитов и выводов (подсказка: `connection.getSignaturesForAddress` для карточки).
 11. *(нед. 14)* Добавить на сайт панель админа: кнопка `sync_vault`, видна только кошельку админа.
 12. *(нед. 14)* Обновлять данные сразу при изменении vault через `connection.onAccountChange`, а не раз в 20 секунд.
+
+### Решения
+
+Все 12 заданий сделаны. **Контракт изменился** (новые поля в `VaultState`, новый аккаунт в `deposit`),
+поэтому после обновления:
+
+```bash
+anchor build && anchor deploy --provider.cluster devnet
+yarn sync-idl     # настоящий IDL в app/src/idl/ (в репозитории — сгенерированный вручную, тот же формат)
+yarn setup-demo   # старые vault на devnet имеют прежний размер VaultState — нужен новый vault
+yarn test
+cd app && yarn test
+```
+
+| # | Где | Что сделано |
+|---|---|---|
+| 1 | `lib.rs`: `deposit`, `deposit_fee`, `set_fee_wallet` | 1% (`DEPOSIT_FEE_BPS = 100`, округление вниз) переводится на токен-аккаунт `fee_wallet` (аккаунт `fee_token_account` в `Deposit`, проверка `token::authority = vault_state.fee_wallet`). Shares и `total_tokens` считаются от суммы **без** комиссии, в карточку пишется она же. По умолчанию `fee_wallet` = админ; сменить — `set_fee_wallet` (только админ). |
+| 2 | `lib.rs`: `initialize_vault`, `deposit` | `min_deposit` = 1 целый токен (`10^decimals`), меньше — `DepositTooSmall`. |
+| 3 | `lib.rs`: `set_paused`, `deposit` | Флаг `paused`: депозит — `VaultPaused`, **вывод работает** (свои деньги забрать можно всегда). На сайте — кнопка в панели админа. |
+| 4 | `tests/vault.ts`, блок «задание 4» | Отдельный vault, трое вносят 100 / 250 / 650: доли shares = доли внесённого (10/25/65%), каждый выводит ровно свою часть. |
+| 5 | `lib.rs`: `withdraw_all` | Берёт `user_share_account.amount` на цепочке и вызывает общую с `withdraw` функцию `withdraw_shares`. На сайте — «Вывести всё». |
+| 6 | `lib.rs`: `close_user_card` | `close = user`, если в карточке и на share-аккаунте 0 shares (иначе `CardHasShares`). Рента возвращается пользователю, карточку можно создать снова. На сайте — «Закрыть карточку». |
+| 7 | `raydium.rs`: `swap` | A → B: `amount_in ≤ 50%` текущего баланса TOKEN_A vault (`MAX_SWAP_BPS = 5000`), иначе `SwapTooLarge`. B → A не ограничен — это возврат в TOKEN_A. `amount_in = u64::MAX` для A → B теперь тоже отклоняется. |
+| 8 | `raydium.rs`: `increase_liquidity` | CPI `increase_liquidity_v2` в позицию vault. Approve админу, как в `open_position`, не нужен: токены списывает `nft_owner` — сам vault PDA. |
+| 9 | `raydium.rs`: `collect_and_record` | `total_fees_a` / `total_fees_b` в `VaultState`: разница балансов vault до и после сбора комиссий. `close_position` теперь сначала забирает комиссии отдельно (decrease с ликвидностью 0), иначе их не отличить от вернувшейся ликвидности. |
+| 10 | `app/src/lib/history.ts`, `HistoryCard.tsx` | `getSignaturesForAddress(карточка)` → `getTransactions` → тип операции декодируется по IDL, суммы — по `pre/postTokenBalances` кошелька. |
+| 11 | `app/src/components/AdminPanel.tsx` | Видна, только если кошелёк = `VaultState.admin`. Кнопка `sync_vault` выключена с объяснением, если контракт всё равно откажет (позиция открыта, есть TOKEN_B). Защищает не сайт, а `has_one = admin` в контракте. |
+| 12 | `app/src/lib/live.ts`, `App.tsx` | `onAccountChange` на vault, его токены, карточку, ATA пользователя и сам кошелёк; изменения собираются debounce в один `refresh()`. `setInterval` убран; при смене кошелька подписки снимаются. |
+
+Новые ошибки контракта: `DepositTooSmall`, `VaultPaused`, `CardHasShares`, `SwapTooLarge` (коды 6015–6018).
+`yarn setup-demo` теперь создаёт админу ATA для комиссии; если его нет, сайт создаёт его в транзакции депозита.

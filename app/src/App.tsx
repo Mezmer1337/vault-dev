@@ -1,16 +1,32 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import { getAssociatedTokenAddressSync } from "@solana/spl-token";
+import { PublicKey } from "@solana/web3.js";
 import { ActionForm } from "./components/ActionForm";
-import { EXPLORER, TOKEN_MINT, TOKEN_SYMBOL } from "./config";
+import { AdminPanel } from "./components/AdminPanel";
+import { HistoryCard } from "./components/HistoryCard";
+import { EXPLORER, PROGRAM_ID, TOKEN_MINT, TOKEN_SYMBOL } from "./config";
 import { formatAmount } from "./lib/amount";
 import { describeError } from "./lib/errors";
-import { previewShares, previewWithdraw } from "./lib/math";
+import { fetchHistory, type HistoryItem } from "./lib/history";
+import { watchAccounts } from "./lib/live";
+import { depositFee, previewDepositShares, previewWithdraw } from "./lib/math";
 import {
+  cardPda,
+  closeCard,
+  connection,
   createCard,
   deposit,
+  getProgram,
   loadUser,
   loadVault,
+  loadVaultTokenB,
+  setPaused,
+  shareMintPda,
+  syncVault,
   vaultPda,
+  vaultTokensPda,
   withdraw,
+  withdrawAll,
   type UserView,
   type VaultView,
 } from "./lib/vault";
@@ -36,6 +52,10 @@ export default function App() {
   const [loadError, setLoadError] = useState("");
   const [busy, setBusy] = useState(false);
   const [status, setStatus] = useState<Status>(null);
+  const [history, setHistory] = useState<HistoryItem[] | null>(null); // задание 10; null = грузим
+  const [historyError, setHistoryError] = useState("");
+  const [tokenB, setTokenB] = useState<bigint | null>(null); // задание 11: TOKEN_B у vault для админа
+  const [lastUpdate, setLastUpdate] = useState<Date | null>(null); // задание 12
 
   // Текущий кошелёк для асинхронного кода: замыкание могло запомнить уже старый
   const walletRef = useRef<BrowserWallet | null>(null);
@@ -52,10 +72,14 @@ export default function App() {
     const stale = () => id !== requestId.current || walletRef.current !== w;
     try {
       const [v, u] = await Promise.all([loadVault(), w ? loadUser(w.publicKey) : null]);
+      // Админу ещё нужен баланс TOKEN_B (sync_vault требует 0) — остальным не грузим
+      const b = v && w && v.admin.equals(w.publicKey) ? await loadVaultTokenB(v) : null;
       if (stale()) return;
       setVault(v);
       setUser(u);
+      setTokenB(b);
       setLoadError("");
+      setLastUpdate(new Date());
     } catch (e) {
       if (stale()) return;
       setLoadError(describeError(e));
@@ -66,10 +90,56 @@ export default function App() {
   useEffect(() => {
     setUser(null);
     setLoadError("");
+    setHistory(null);
+    setHistoryError("");
     refresh();
-    const timer = setInterval(refresh, 20_000);
-    return () => clearInterval(timer);
   }, [wallet, refresh]);
+
+  // Задание 12. Вместо опроса раз в 20 секунд — подписки onAccountChange на всё, что показывает сайт:
+  // vault и его токены, а с кошельком — карточку, ATA для TOKEN_A и shares и сам кошелёк (SOL).
+  // Любое изменение (своя транзакция, чужой депозит, sync_vault админа) → refresh() почти сразу.
+  const vaultB = vault?.pairSet ? vault.vaultTokenAccountB.toBase58() : null;
+  useEffect(() => {
+    const keys = [vaultPda, vaultTokensPda];
+    if (wallet) {
+      const owner = wallet.publicKey;
+      keys.push(
+        cardPda(owner),
+        getAssociatedTokenAddressSync(TOKEN_MINT, owner),
+        getAssociatedTokenAddressSync(shareMintPda, owner),
+        owner
+      );
+    }
+    if (vaultB) keys.push(new PublicKey(vaultB));
+    return watchAccounts(connection, keys, () => refresh());
+  }, [wallet, vaultB, refresh]);
+
+  // Задание 10. История карточки. Перезагружаем, когда меняются данные карточки или балансы:
+  // значит, прошла новая операция (неважно — с этого сайта или нет).
+  const historyKey = user
+    ? `${user.card ? `${user.card.deposited}/${user.card.shares}` : "no-card"}/${user.shares}/${user.tokens}`
+    : null;
+  const historyReq = useRef(0);
+  useEffect(() => {
+    if (!wallet || historyKey === null) return;
+    const id = ++historyReq.current;
+    const program = getProgram();
+    fetchHistory({
+      connection,
+      card: cardPda(wallet.publicKey),
+      user: wallet.publicKey,
+      tokenMint: TOKEN_MINT,
+      shareMint: shareMintPda,
+      programId: PROGRAM_ID,
+      decode: (data) => program.coder.instruction.decode(data),
+    })
+      .then((items) => {
+        if (id !== historyReq.current) return;
+        setHistory(items);
+        setHistoryError("");
+      })
+      .catch((e) => id === historyReq.current && setHistoryError(describeError(e)));
+  }, [wallet, historyKey]);
 
   // Phantom: тихое подключение, если сайт уже разрешён; смена аккаунта; отключение из кошелька.
   // Тестовый кошелёк события Phantom не трогают.
@@ -136,6 +206,9 @@ export default function App() {
   const pausedReason = vault?.inMarket
     ? "Деньги vault сейчас в рынке (swap или позиция Raydium). Внесение и вывод откроются после sync_vault."
     : undefined;
+  // Задание 3: админ поставил депозиты на паузу — вывод при этом работает
+  const depositBlocked = pausedReason ?? (vault?.paused ? "Админ поставил депозиты на паузу. Вывод доступен." : undefined);
+  const isAdmin = !!(vault && wallet && vault.admin.equals(wallet.publicKey));
 
   return (
     <div className="page">
@@ -215,6 +288,12 @@ export default function App() {
               </div>
             </dl>
             <p className="muted small">
+              Комиссия депозита 1% · Минимум {tokenFmt(vault.minDeposit)} ·{" "}
+              {vault.paused && (
+                <>
+                  <span className="warn">Депозиты на паузе</span> ·{" "}
+                </>
+              )}
               Пара для Raydium: {vault.pairSet ? "задана" : "не задана"} · Позиция в пуле:{" "}
               {vault.positionOpen ? "открыта" : "нет"} · Админ:{" "}
               <a href={EXPLORER("address", vault.admin.toBase58())} target="_blank" rel="noreferrer">
@@ -290,12 +369,14 @@ export default function App() {
                       unit={TOKEN_SYMBOL}
                       decimals={vault.decimals}
                       max={user.tokens}
+                      min={vault.minDeposit}
                       busy={busy}
-                      blockedReason={pausedReason}
+                      blockedReason={depositBlocked}
                       submitLabel="Внести"
-                      previewOut={(a) => previewShares(a, vault.totalTokens, vault.totalShares)}
+                      previewOut={(a) => previewDepositShares(a, vault.totalTokens, vault.totalShares)}
                       formatOut={shareFmt}
-                      onSubmit={(a) => run(`Внесено ${tokenFmt(a)}.`, () => deposit(wallet, a))}
+                      note={(a) => `комиссия 1%: ${tokenFmt(depositFee(a))}`}
+                      onSubmit={(a) => run(`Внесено ${tokenFmt(a)}.`, () => deposit(wallet, a, vault.feeWallet))}
                     />
                     <ActionForm
                       title="Вывести"
@@ -310,6 +391,25 @@ export default function App() {
                       onSubmit={(s) => run(`Выведено ${shareFmt(s)}.`, () => withdraw(wallet, s))}
                     />
                   </div>
+                  <div className="row-buttons">
+                    {/* Задание 5: вывести все shares одной инструкцией */}
+                    <button
+                      className="ghost"
+                      disabled={busy || !!pausedReason || user.shares === 0n}
+                      onClick={() => run("Выведены все shares.", () => withdrawAll(wallet))}
+                    >
+                      Вывести всё
+                    </button>
+                    {/* Задание 6: закрыть карточку без shares и вернуть ренту */}
+                    <button
+                      className="ghost"
+                      disabled={busy || user.shares > 0n || user.card.shares > 0n}
+                      title={user.shares > 0n ? "Сначала выведите все shares" : "Рента ~0.0015 SOL вернётся на кошелёк"}
+                      onClick={() => run("Карточка закрыта, рента возвращена.", () => closeCard(wallet))}
+                    >
+                      Закрыть карточку
+                    </button>
+                  </div>
                 </>
               )}
             </>
@@ -317,9 +417,31 @@ export default function App() {
         </section>
       )}
 
+      {vault && wallet && user?.card && (
+        <HistoryCard items={history} error={historyError} tokenFmt={tokenFmt} shareFmt={shareFmt} />
+      )}
+
+      {/* Задание 11: только кошелёк админа видит панель (проверку делает и контракт: has_one = admin) */}
+      {vault && wallet && isAdmin && (
+        <AdminPanel
+          vault={vault}
+          tokenB={tokenB}
+          busy={busy}
+          tokenFmt={tokenFmt}
+          onSync={() => run("Vault синхронизирован.", () => syncVault(wallet, vault))}
+          onTogglePause={() =>
+            run(vault.paused ? "Пауза снята." : "Депозиты на паузе.", () => setPaused(wallet, !vault.paused))
+          }
+        />
+      )}
+
       <footer className="muted small">
-        Swap, позицию Raydium и sync_vault выполняет админ скриптами и тестами (недели 12–13). Сайт только
-        показывает, в каком режиме vault.
+        Swap и позицию Raydium админ делает скриптами и тестами (недели 12–13); sync_vault и пауза — в панели админа.
+        Данные обновляются сами через WebSocket (<code>onAccountChange</code>)
+        {lastUpdate && <> · обновлено {lastUpdate.toLocaleTimeString("ru-RU")}</>} ·{" "}
+        <button className="link" onClick={() => refresh()}>
+          обновить
+        </button>
       </footer>
     </div>
   );

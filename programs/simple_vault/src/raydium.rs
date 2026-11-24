@@ -1,9 +1,10 @@
 //! Недели 12–13: vault работает с Raydium CLMM через CPI.
 //!
 //!   add_pair_token  — завести vault второй токен (TOKEN_B пула)
-//!   swap            — неделя 12: обменять токены vault через пул
+//!   swap            — неделя 12: обменять токены vault через пул (задание 7: A → B не больше 50%)
 //!   open_position   — неделя 13: положить A и B в ценовой диапазон
-//!   collect_fees    — неделя 13: забрать накопленные комиссии
+//!   collect_fees    — неделя 13: забрать накопленные комиссии (+ задание 9: счётчик total_fees_*)
+//!   increase_liquidity — задание 8: доложить токены в открытую позицию
 //!   close_position  — неделя 13: вывести всё из позиции и закрыть её
 //!   sync_vault      — вернуть vault в обычный режим, когда всё снова в TOKEN_A
 //!
@@ -20,7 +21,10 @@ use raydium_clmm_cpi::{
     states::{PersonalPositionState, PoolState},
 };
 
-use crate::{VaultError, VaultState};
+use crate::{VaultError, VaultState, BPS_DENOMINATOR};
+
+/// Задание 7: максимум TOKEN_A vault за один swap A → B (5000 bps = 50%).
+pub const MAX_SWAP_BPS: u64 = 5_000;
 
 /// Подпись vault PDA: seeds = ["vault", token_mint, bump].
 /// `vault_signer!(signer, vault)` объявляет переменную `signer` для CpiContext::new_with_signer.
@@ -172,6 +176,16 @@ pub fn swap<'a, 'b, 'c: 'info, 'info>(
         amount_in
     };
     require!(amount_in > 0, VaultError::ZeroAmount);
+
+    // Задание 7: за один обмен A → B — не больше 50% TOKEN_A, который сейчас лежит в vault.
+    // (u128, чтобы amount_in * 2 не переполнился; B → A не ограничиваем — это возврат в TOKEN_A)
+    if a_to_b {
+        let balance_a = ctx.accounts.vault_token_account.amount as u128;
+        require!(
+            (amount_in as u128) * BPS_DENOMINATOR as u128 <= balance_a * MAX_SWAP_BPS as u128,
+            VaultError::SwapTooLarge
+        );
+    }
 
     let vault = &ctx.accounts.vault_state;
     let (input_mint, output_mint) = if a_to_b {
@@ -537,12 +551,94 @@ fn decrease_liquidity<'info>(
     cpi::decrease_liquidity_v2(cpi_ctx, liquidity, amount_0_min, amount_1_min)
 }
 
+/// Задание 9. Забрать комиссии позиции (decrease с liquidity = 0) и прибавить их к счётчикам vault.
+/// Сколько пришло — считаем по балансам vault до и после CPI.
+fn collect_and_record<'info>(accounts: &mut VaultPosition<'info>, remaining: &[AccountInfo<'info>]) -> Result<()> {
+    let a_before = accounts.vault_token_account.amount;
+    let b_before = accounts.vault_token_account_b.amount;
+
+    decrease_liquidity(accounts, remaining, 0, 0, 0)?;
+
+    // CPI изменил аккаунты — перечитываем балансы
+    accounts.vault_token_account.reload()?;
+    accounts.vault_token_account_b.reload()?;
+    let fee_a = accounts.vault_token_account.amount.saturating_sub(a_before);
+    let fee_b = accounts.vault_token_account_b.amount.saturating_sub(b_before);
+
+    let vault = &mut accounts.vault_state;
+    vault.total_fees_a = vault.total_fees_a.checked_add(fee_a).ok_or(VaultError::MathOverflow)?;
+    vault.total_fees_b = vault.total_fees_b.checked_add(fee_b).ok_or(VaultError::MathOverflow)?;
+
+    msg!(
+        "Fees collected: A +{}, B +{} (all time: A {}, B {})",
+        fee_a, fee_b, vault.total_fees_a, vault.total_fees_b
+    );
+    Ok(())
+}
+
 /// Забрать комиссии позиции в vault, ликвидность остаётся в пуле.
 pub fn collect_fees<'a, 'b, 'c: 'info, 'info>(
     ctx: Context<'a, 'b, 'c, 'info, VaultPosition<'info>>,
 ) -> Result<()> {
-    decrease_liquidity(&ctx.accounts, ctx.remaining_accounts, 0, 0, 0)?;
-    msg!("Fees collected");
+    collect_and_record(&mut *ctx.accounts, ctx.remaining_accounts)
+}
+
+/// Задание 8. Доложить токены vault в уже открытую позицию.
+/// Как и в open_position, ликвидность считает Raydium от base-суммы:
+/// base_0 = true → от `amount_0_max`, иначе от `amount_1_max`.
+/// В отличие от open_position, approve админу не нужен: в increase_liquidity_v2 токены
+/// списывает `nft_owner`, а это и есть vault PDA — он подписывает CPI своими seeds.
+pub fn increase_liquidity<'a, 'b, 'c: 'info, 'info>(
+    ctx: Context<'a, 'b, 'c, 'info, VaultPosition<'info>>,
+    amount_0_max: u64,
+    amount_1_max: u64,
+    base_0: bool,
+) -> Result<()> {
+    require!(amount_0_max > 0 || amount_1_max > 0, VaultError::ZeroAmount);
+
+    let a_is_token_0 = {
+        let pool = ctx.accounts.pool_state.load()?;
+        check_pool(&ctx.accounts.vault_state, &pool)?;
+        pool.token_mint_0 == ctx.accounts.vault_state.token_mint
+    };
+    let (account_0, account_1) = if a_is_token_0 {
+        (ctx.accounts.vault_token_account.to_account_info(), ctx.accounts.vault_token_account_b.to_account_info())
+    } else {
+        (ctx.accounts.vault_token_account_b.to_account_info(), ctx.accounts.vault_token_account.to_account_info())
+    };
+
+    let liquidity_before = ctx.accounts.personal_position.liquidity;
+
+    let cpi_accounts = cpi::accounts::IncreaseLiquidityV2 {
+        nft_owner: ctx.accounts.vault_state.to_account_info(),
+        nft_account: ctx.accounts.position_nft_account.to_account_info(),
+        pool_state: ctx.accounts.pool_state.to_account_info(),
+        protocol_position: ctx.accounts.personal_position.to_account_info(), // устаревшее поле Raydium
+        personal_position: ctx.accounts.personal_position.to_account_info(),
+        tick_array_lower: ctx.accounts.tick_array_lower.to_account_info(),
+        tick_array_upper: ctx.accounts.tick_array_upper.to_account_info(),
+        token_account_0: account_0,
+        token_account_1: account_1,
+        token_vault_0: ctx.accounts.token_vault_0.to_account_info(),
+        token_vault_1: ctx.accounts.token_vault_1.to_account_info(),
+        token_program: ctx.accounts.token_program.to_account_info(),
+        token_program_2022: ctx.accounts.token_program_2022.to_account_info(),
+        vault_0_mint: ctx.accounts.vault_0_mint.to_account_info(),
+        vault_1_mint: ctx.accounts.vault_1_mint.to_account_info(),
+    };
+    vault_signer!(signer, ctx.accounts.vault_state);
+    let cpi_ctx = CpiContext::new_with_signer(ctx.accounts.clmm_program.to_account_info(), cpi_accounts, signer)
+        .with_remaining_accounts(ctx.remaining_accounts.to_vec());
+
+    cpi::increase_liquidity_v2(cpi_ctx, 0, amount_0_max, amount_1_max, Some(base_0))?;
+
+    // Позиция открыта → vault и так in_market; на всякий случай фиксируем
+    ctx.accounts.vault_state.in_market = true;
+
+    msg!(
+        "Liquidity increased: max0={}, max1={}, base_0={}, liquidity before={}",
+        amount_0_max, amount_1_max, base_0, liquidity_before
+    );
     Ok(())
 }
 
@@ -554,8 +650,12 @@ pub fn close_position<'a, 'b, 'c: 'info, 'info>(
     amount_1_min: u64,
 ) -> Result<()> {
     let liquidity = ctx.accounts.personal_position.liquidity;
-    // Даже при нулевой ликвидности вызываем decrease: он заберёт остаток комиссий
-    decrease_liquidity(&ctx.accounts, ctx.remaining_accounts, liquidity, amount_0_min, amount_1_min)?;
+    // Задание 9: сначала отдельно забираем комиссии, чтобы посчитать их в total_fees_*.
+    // Иначе комиссии придут вместе с ликвидностью и их не отличить.
+    collect_and_record(&mut *ctx.accounts, ctx.remaining_accounts)?;
+    if liquidity > 0 {
+        decrease_liquidity(&*ctx.accounts, ctx.remaining_accounts, liquidity, amount_0_min, amount_1_min)?;
+    }
 
     let close_accounts = cpi::accounts::ClosePosition {
         nft_owner: ctx.accounts.vault_state.to_account_info(), // сюда вернётся рента personal_position

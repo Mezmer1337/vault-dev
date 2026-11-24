@@ -6,6 +6,10 @@ interface Props {
   unit: string; // что вводим: TOKEN_A или shares
   decimals: number;
   max: bigint; // сколько есть у пользователя
+  /** Минимальная сумма (задание 2: минимальный депозит). */
+  min?: bigint;
+  /** Пояснение под суммой, например «комиссия 1%: 0.01 TOKEN_A». */
+  note?: (amount: bigint) => string | undefined;
   /** Сколько пользователь получит за `amount` (та же формула, что в контракте). */
   previewOut: (amount: bigint) => bigint;
   /** Как показать полученное: «12.5 shares». */
@@ -27,6 +31,7 @@ export function ActionForm(p: Props) {
       amount = parseAmount(text, p.decimals);
       if (amount === 0n) inputError = "Сумма должна быть больше нуля";
       else if (amount > p.max) inputError = `У вас только ${formatAmount(p.max, p.decimals)} ${p.unit}`;
+      else if (p.min !== undefined && amount < p.min) inputError = `Минимум ${formatAmount(p.min, p.decimals)} ${p.unit}`;
       // контракт откажет (SharesTooSmall / WithdrawTooSmall) — не гоняем пользователя в кошелёк зря
       else if (p.previewOut(amount) === 0n) inputError = "Слишком мало: за эту сумму вы получите 0";
     } catch (e: any) {
@@ -64,7 +69,13 @@ export function ActionForm(p: Props) {
       </div>
       <p className="hint">
         {p.blockedReason ??
-          (inputError ? <span className="bad">{inputError}</span> : amount ? `Получите ≈ ${p.formatOut(p.previewOut(amount))}` : `Доступно: ${formatAmount(p.max, p.decimals)} ${p.unit}`)}
+          (inputError ? (
+            <span className="bad">{inputError}</span>
+          ) : amount ? (
+            [`Получите ≈ ${p.formatOut(p.previewOut(amount))}`, p.note?.(amount)].filter(Boolean).join(" · ")
+          ) : (
+            `Доступно: ${formatAmount(p.max, p.decimals)} ${p.unit}`
+          ))}
       </p>
       <button type="submit" disabled={!ready}>
         {p.busy ? "Ждём подтверждения…" : p.submitLabel}

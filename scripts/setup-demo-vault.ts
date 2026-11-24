@@ -3,8 +3,9 @@
  *
  * Что делает:
  *   1. создаёт новый токен TOKEN_A (6 знаков, mint authority = ваш кошелёк);
- *   2. вызывает initialize_vault для этого токена;
- *   3. записывает адреса в app/src/vault-config.json — сайт будет показывать этот vault.
+ *   2. вызывает initialize_vault для этого токена (fee_wallet = админ, минимум 1 токен);
+ *   3. создаёт админу ATA для TOKEN_A — туда идёт комиссия 1% с депозитов (задание 1);
+ *   4. записывает адреса в app/src/vault-config.json — сайт будет показывать этот vault.
  *
  * Запуск (из корня проекта):
  *   yarn setup-demo
@@ -13,7 +14,7 @@
  *   DEVNET_RPC     свой RPC devnet (по умолчанию https://api.devnet.solana.com)
  */
 import * as anchor from "@coral-xyz/anchor";
-import { createMint } from "@solana/spl-token";
+import { createMint, getOrCreateAssociatedTokenAccount } from "@solana/spl-token";
 import { PublicKey } from "@solana/web3.js";
 import * as fs from "fs";
 import * as path from "path";
@@ -44,6 +45,10 @@ async function main() {
     .rpc();
   console.log("Vault:", vaultState.toBase58());
   console.log("initialize_vault:", sig);
+
+  // Задание 1: комиссия депозита идёт на токен-аккаунт fee_wallet (по умолчанию — админ)
+  const feeAccount = await getOrCreateAssociatedTokenAccount(connection, admin, tokenMint, admin.publicKey);
+  console.log("Аккаунт для комиссии 1%:", feeAccount.address.toBase58());
 
   const config = {
     rpcUrl: "https://api.devnet.solana.com",

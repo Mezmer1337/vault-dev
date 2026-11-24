@@ -6,6 +6,19 @@ use raydium::*;
 
 declare_id!("EbojNUfh9Jk6dyZaaQAJWofbdnkvdxfQbeAPq6iWoHAu");
 
+/// Задание 1: комиссия на депозит в базисных пунктах (100 bps = 1%).
+pub const DEPOSIT_FEE_BPS: u64 = 100;
+pub const BPS_DENOMINATOR: u64 = 10_000;
+
+/// Комиссия с суммы депозита (округление вниз — в пользу пользователя).
+pub fn deposit_fee(amount: u64) -> Result<u64> {
+    (amount as u128)
+        .checked_mul(DEPOSIT_FEE_BPS as u128)
+        .map(|v| v / BPS_DENOMINATOR as u128)
+        .and_then(|v| u64::try_from(v).ok())
+        .ok_or(error!(VaultError::MathOverflow))
+}
+
 #[program]
 pub mod simple_vault {
     use super::*;
@@ -21,8 +34,30 @@ pub mod simple_vault {
         vault.total_tokens = 0;
         vault.total_shares = 0;
         vault.bump = ctx.bumps.vault_state;
+        // Задание 1: по умолчанию комиссия уходит админу, сменить — set_fee_wallet
+        vault.fee_wallet = ctx.accounts.admin.key();
+        // Задание 2: минимальный депозит — 1 целый токен (10^decimals минимальных единиц)
+        vault.min_deposit = 10u64
+            .checked_pow(ctx.accounts.token_mint.decimals as u32)
+            .ok_or(VaultError::MathOverflow)?;
+        vault.paused = false;
 
         msg!("Vault initialized for mint: {}", vault.token_mint);
+        Ok(())
+    }
+
+    /// Задание 1. Админ меняет кошелёк, на который идёт комиссия 1%.
+    pub fn set_fee_wallet(ctx: Context<AdminOnly>, fee_wallet: Pubkey) -> Result<()> {
+        ctx.accounts.vault_state.fee_wallet = fee_wallet;
+        msg!("Fee wallet: {}", fee_wallet);
+        Ok(())
+    }
+
+    /// Задание 3. Админ ставит депозиты на паузу (paused = true) или снимает паузу.
+    /// Вывод на паузе остаётся доступен: пользователь всегда может забрать свои деньги.
+    pub fn set_paused(ctx: Context<AdminOnly>, paused: bool) -> Result<()> {
+        ctx.accounts.vault_state.paused = paused;
+        msg!("Vault paused: {}", paused);
         Ok(())
     }
 
@@ -40,20 +75,29 @@ pub mod simple_vault {
 
     /// Пользователь вносит `amount` токенов → получает share-токены.
     ///
-    /// Формула:
-    ///   Первый депозит:       shares = amount  (1:1)
-    ///   Последующие депозиты: shares = amount * total_shares / total_tokens
+    /// Комиссия 1% (задание 1) уходит на `fee_wallet`, shares считаются от остатка `net`:
+    ///   net = amount - amount * 1%
+    ///   Первый депозит:       shares = net  (1:1)
+    ///   Последующие депозиты: shares = net * total_shares / total_tokens
     pub fn deposit(ctx: Context<Deposit>, amount: u64) -> Result<()> {
         require!(amount > 0, VaultError::ZeroAmount);
         require!(!ctx.accounts.vault_state.in_market, VaultError::InMarket);
+        // Задание 3: админ поставил депозиты на паузу
+        require!(!ctx.accounts.vault_state.paused, VaultError::VaultPaused);
+        // Задание 2: минимальный депозит
+        require!(amount >= ctx.accounts.vault_state.min_deposit, VaultError::DepositTooSmall);
 
         let vault = &ctx.accounts.vault_state;
 
+        // Задание 1: комиссия и сумма, которая реально попадёт в vault
+        let fee = deposit_fee(amount)?;
+        let net = amount.checked_sub(fee).ok_or(VaultError::MathOverflow)?;
+
         // Сколько shares получит пользователь
         let shares = if vault.total_shares == 0 || vault.total_tokens == 0 {
-            amount // первый депозит: 1 share = 1 token
+            net // первый депозит: 1 share = 1 token
         } else {
-            (amount as u128)
+            (net as u128)
                 .checked_mul(vault.total_shares as u128)
                 .and_then(|v| v.checked_div(vault.total_tokens as u128))
                 .and_then(|v| u64::try_from(v).ok())
@@ -61,7 +105,22 @@ pub mod simple_vault {
         };
         require!(shares > 0, VaultError::SharesTooSmall);
 
-        // 1. Переводим токены: пользователь → vault
+        // 0. Комиссия: пользователь → fee_wallet
+        if fee > 0 {
+            token::transfer(
+                CpiContext::new(
+                    ctx.accounts.token_program.to_account_info(),
+                    Transfer {
+                        from: ctx.accounts.user_token_account.to_account_info(),
+                        to: ctx.accounts.fee_token_account.to_account_info(),
+                        authority: ctx.accounts.user.to_account_info(),
+                    },
+                ),
+                fee,
+            )?;
+        }
+
+        // 1. Переводим токены: пользователь → vault (уже без комиссии)
         token::transfer(
             CpiContext::new(
                 ctx.accounts.token_program.to_account_info(),
@@ -71,7 +130,7 @@ pub mod simple_vault {
                     authority: ctx.accounts.user.to_account_info(),
                 },
             ),
-            amount,
+            net,
         )?;
 
         // 2. Печатаем shares пользователю (подписывает vault PDA)
@@ -98,16 +157,17 @@ pub mod simple_vault {
 
         // 3. Обновляем vault и карточку пользователя
         let vault = &mut ctx.accounts.vault_state;
-        vault.total_tokens = vault.total_tokens.checked_add(amount).ok_or(VaultError::MathOverflow)?;
+        vault.total_tokens = vault.total_tokens.checked_add(net).ok_or(VaultError::MathOverflow)?;
         vault.total_shares = vault.total_shares.checked_add(shares).ok_or(VaultError::MathOverflow)?;
 
+        // В карточку пишем то, что реально легло в vault (без комиссии)
         let card = &mut ctx.accounts.user_card;
-        card.deposited = card.deposited.checked_add(amount).ok_or(VaultError::MathOverflow)?;
+        card.deposited = card.deposited.checked_add(net).ok_or(VaultError::MathOverflow)?;
         card.shares = card.shares.checked_add(shares).ok_or(VaultError::MathOverflow)?;
 
         msg!(
-            "Deposit: {} tokens -> {} shares (total_tokens={}, total_shares={})",
-            amount, shares, vault.total_tokens, vault.total_shares
+            "Deposit: {} tokens (fee {}) -> {} shares (total_tokens={}, total_shares={})",
+            amount, fee, shares, vault.total_tokens, vault.total_shares
         );
         Ok(())
     }
@@ -116,69 +176,20 @@ pub mod simple_vault {
     ///
     /// Формула: tokens = shares * total_tokens / total_shares
     pub fn withdraw(ctx: Context<Withdraw>, shares_amount: u64) -> Result<()> {
-        require!(shares_amount > 0, VaultError::ZeroAmount);
-        require!(!ctx.accounts.vault_state.in_market, VaultError::InMarket);
+        withdraw_shares(ctx.accounts, shares_amount)
+    }
 
-        let vault = &ctx.accounts.vault_state;
-        require!(vault.total_shares > 0, VaultError::VaultEmpty);
+    /// Задание 5. Сжечь все shares пользователя за один вызов.
+    /// Сколько их — берём из share-аккаунта на цепочке, а не с клиента.
+    pub fn withdraw_all(ctx: Context<Withdraw>) -> Result<()> {
+        let all = ctx.accounts.user_share_account.amount;
+        withdraw_shares(ctx.accounts, all)
+    }
 
-        // Сколько токенов положено за эти shares
-        let tokens_out = (shares_amount as u128)
-            .checked_mul(vault.total_tokens as u128)
-            .and_then(|v| v.checked_div(vault.total_shares as u128))
-            .and_then(|v| u64::try_from(v).ok())
-            .ok_or(VaultError::MathOverflow)?;
-        require!(tokens_out > 0, VaultError::WithdrawTooSmall);
-
-        // 1. Сжигаем shares пользователя (подписывает сам пользователь)
-        token::burn(
-            CpiContext::new(
-                ctx.accounts.token_program.to_account_info(),
-                Burn {
-                    mint: ctx.accounts.share_mint.to_account_info(),
-                    from: ctx.accounts.user_share_account.to_account_info(),
-                    authority: ctx.accounts.user.to_account_info(),
-                },
-            ),
-            shares_amount,
-        )?;
-
-        // 2. Отправляем токены: vault → пользователь (подписывает vault PDA)
-        let token_mint_key = ctx.accounts.vault_state.token_mint;
-        let seeds = &[
-            b"vault".as_ref(),
-            token_mint_key.as_ref(),
-            &[ctx.accounts.vault_state.bump],
-        ];
-        let signer = &[&seeds[..]];
-
-        token::transfer(
-            CpiContext::new_with_signer(
-                ctx.accounts.token_program.to_account_info(),
-                Transfer {
-                    from: ctx.accounts.vault_token_account.to_account_info(),
-                    to: ctx.accounts.user_token_account.to_account_info(),
-                    authority: ctx.accounts.vault_state.to_account_info(),
-                },
-                signer,
-            ),
-            tokens_out,
-        )?;
-
-        // 3. Обновляем vault и карточку пользователя
-        let vault = &mut ctx.accounts.vault_state;
-        vault.total_tokens = vault.total_tokens.checked_sub(tokens_out).ok_or(VaultError::MathOverflow)?;
-        vault.total_shares = vault.total_shares.checked_sub(shares_amount).ok_or(VaultError::MathOverflow)?;
-
-        // saturating: shares можно передать другому кошельку, тогда в карточке их может быть меньше
-        let card = &mut ctx.accounts.user_card;
-        card.deposited = card.deposited.saturating_sub(tokens_out);
-        card.shares = card.shares.saturating_sub(shares_amount);
-
-        msg!(
-            "Withdraw: {} shares -> {} tokens (total_tokens={}, total_shares={})",
-            shares_amount, tokens_out, vault.total_tokens, vault.total_shares
-        );
+    /// Задание 6. Закрыть карточку, когда shares не осталось: рента возвращается пользователю.
+    /// Проверку shares делает `constraint` в `CloseUserCard`, закрытие — `close = user`.
+    pub fn close_user_card(ctx: Context<CloseUserCard>) -> Result<()> {
+        msg!("User card closed: {}", ctx.accounts.user_card.owner);
         Ok(())
     }
 
@@ -222,6 +233,16 @@ pub mod simple_vault {
         )
     }
 
+    /// Задание 8. Админ докладывает токены vault в уже открытую позицию.
+    pub fn increase_liquidity<'a, 'b, 'c: 'info, 'info>(
+        ctx: Context<'a, 'b, 'c, 'info, VaultPosition<'info>>,
+        amount_0_max: u64,
+        amount_1_max: u64,
+        base_0: bool,
+    ) -> Result<()> {
+        raydium::increase_liquidity(ctx, amount_0_max, amount_1_max, base_0)
+    }
+
     /// Неделя 13. Админ забирает накопленные комиссии позиции в vault.
     pub fn collect_fees<'a, 'b, 'c: 'info, 'info>(
         ctx: Context<'a, 'b, 'c, 'info, VaultPosition<'info>>,
@@ -244,9 +265,122 @@ pub mod simple_vault {
     }
 }
 
+/// Общая логика withdraw и withdraw_all: сжечь `shares_amount` shares и отдать токены.
+fn withdraw_shares(accounts: &mut Withdraw, shares_amount: u64) -> Result<()> {
+    require!(shares_amount > 0, VaultError::ZeroAmount);
+    require!(!accounts.vault_state.in_market, VaultError::InMarket);
+
+    let vault = &accounts.vault_state;
+    require!(vault.total_shares > 0, VaultError::VaultEmpty);
+
+    // Сколько токенов положено за эти shares
+    let tokens_out = (shares_amount as u128)
+        .checked_mul(vault.total_tokens as u128)
+        .and_then(|v| v.checked_div(vault.total_shares as u128))
+        .and_then(|v| u64::try_from(v).ok())
+        .ok_or(VaultError::MathOverflow)?;
+    require!(tokens_out > 0, VaultError::WithdrawTooSmall);
+
+    // 1. Сжигаем shares пользователя (подписывает сам пользователь)
+    token::burn(
+        CpiContext::new(
+            accounts.token_program.to_account_info(),
+            Burn {
+                mint: accounts.share_mint.to_account_info(),
+                from: accounts.user_share_account.to_account_info(),
+                authority: accounts.user.to_account_info(),
+            },
+        ),
+        shares_amount,
+    )?;
+
+    // 2. Отправляем токены: vault → пользователь (подписывает vault PDA)
+    let token_mint_key = accounts.vault_state.token_mint;
+    let seeds = &[
+        b"vault".as_ref(),
+        token_mint_key.as_ref(),
+        &[accounts.vault_state.bump],
+    ];
+    let signer = &[&seeds[..]];
+
+    token::transfer(
+        CpiContext::new_with_signer(
+            accounts.token_program.to_account_info(),
+            Transfer {
+                from: accounts.vault_token_account.to_account_info(),
+                to: accounts.user_token_account.to_account_info(),
+                authority: accounts.vault_state.to_account_info(),
+            },
+            signer,
+        ),
+        tokens_out,
+    )?;
+
+    // 3. Обновляем vault и карточку пользователя
+    let vault = &mut accounts.vault_state;
+    vault.total_tokens = vault.total_tokens.checked_sub(tokens_out).ok_or(VaultError::MathOverflow)?;
+    vault.total_shares = vault.total_shares.checked_sub(shares_amount).ok_or(VaultError::MathOverflow)?;
+
+    // saturating: shares можно передать другому кошельку, тогда в карточке их может быть меньше
+    let card = &mut accounts.user_card;
+    card.deposited = card.deposited.saturating_sub(tokens_out);
+    card.shares = card.shares.saturating_sub(shares_amount);
+
+    msg!(
+        "Withdraw: {} shares -> {} tokens (total_tokens={}, total_shares={})",
+        shares_amount, tokens_out, vault.total_tokens, vault.total_shares
+    );
+    Ok(())
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Accounts
 // ─────────────────────────────────────────────────────────────────────────────
+
+/// Инструкции, которые может вызвать только админ vault (set_fee_wallet, set_paused).
+#[derive(Accounts)]
+pub struct AdminOnly<'info> {
+    pub admin: Signer<'info>,
+
+    #[account(
+        mut,
+        has_one = admin @ VaultError::Unauthorized,
+        seeds = [b"vault", vault_state.token_mint.as_ref()],
+        bump = vault_state.bump,
+    )]
+    pub vault_state: Account<'info, VaultState>,
+}
+
+/// Задание 6. Закрыть карточку без shares.
+#[derive(Accounts)]
+pub struct CloseUserCard<'info> {
+    #[account(
+        seeds = [b"vault", vault_state.token_mint.as_ref()],
+        bump = vault_state.bump,
+    )]
+    pub vault_state: Account<'info, VaultState>,
+
+    /// Карточка закрывается, рента уходит владельцу
+    #[account(
+        mut,
+        close = user,
+        seeds = [b"user_card", vault_state.key().as_ref(), user.key().as_ref()],
+        bump = user_card.bump,
+        constraint = user_card.shares == 0 @ VaultError::CardHasShares,
+    )]
+    pub user_card: Account<'info, UserCard>,
+
+    /// Share-аккаунт пользователя: на нём тоже должно быть 0 shares
+    #[account(
+        token::mint = vault_state.share_mint,
+        token::authority = user,
+        constraint = user_share_account.amount == 0 @ VaultError::CardHasShares,
+    )]
+    pub user_share_account: Account<'info, TokenAccount>,
+
+    #[account(mut)]
+    pub user: Signer<'info>,
+}
 
 #[derive(Accounts)]
 pub struct InitializeVault<'info> {
@@ -369,6 +503,14 @@ pub struct Deposit<'info> {
     )]
     pub user_share_account: Account<'info, TokenAccount>,
 
+    /// Задание 1: токен-аккаунт fee_wallet (куда идёт комиссия 1%)
+    #[account(
+        mut,
+        token::mint = vault_state.token_mint,
+        token::authority = vault_state.fee_wallet,
+    )]
+    pub fee_token_account: Account<'info, TokenAccount>,
+
     #[account(mut)]
     pub user: Signer<'info>,
 
@@ -451,10 +593,16 @@ pub struct VaultState {
     pub vault_token_account_b: Pubkey, // 32 — PDA для TOKEN_B
     pub position_nft_mint: Pubkey,   // 32 — NFT открытой позиции (неделя 13), default = нет
     pub in_market: bool,             // 1  — деньги в TOKEN_B/позиции: deposit и withdraw на паузе
+    // ─── задания для практики ───
+    pub fee_wallet: Pubkey,          // 32 — задание 1: куда идёт комиссия 1% с депозита
+    pub min_deposit: u64,            // 8  — задание 2: минимальный депозит (в минимальных единицах)
+    pub paused: bool,                // 1  — задание 3: админ остановил депозиты
+    pub total_fees_a: u64,           // 8  — задание 9: собрано комиссий Raydium в TOKEN_A за всё время
+    pub total_fees_b: u64,           // 8  — задание 9: то же в TOKEN_B
 }
 
 impl VaultState {
-    pub const LEN: usize = 8 + 32 + 32 + 32 + 32 + 8 + 8 + 1 + 32 + 32 + 32 + 1;
+    pub const LEN: usize = 8 + 32 + 32 + 32 + 32 + 8 + 8 + 1 + 32 + 32 + 32 + 1 + 32 + 8 + 1 + 8 + 8;
 }
 
 /// Карточка пользователя в vault.
@@ -508,4 +656,33 @@ pub enum VaultError {
     PositionOpen,
     #[msg("Cannot sync: vault still holds TOKEN_B, swap it back to TOKEN_A first")]
     TokenBNotZero,
+    #[msg("Deposit is below the vault minimum")]
+    DepositTooSmall,
+    #[msg("Deposits are paused by admin")]
+    VaultPaused,
+    #[msg("User still has shares: withdraw them before closing the card")]
+    CardHasShares,
+    #[msg("Swap too large: at most 50% of vault TOKEN_A per swap")]
+    SwapTooLarge,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fee_is_one_percent_rounded_down() {
+        assert_eq!(deposit_fee(100_000_000).unwrap(), 1_000_000); // 100 токенов → 1 токен
+        assert_eq!(deposit_fee(1_000_000).unwrap(), 10_000); // 1 токен → 0.01
+        assert_eq!(deposit_fee(99).unwrap(), 0); // меньше 100 единиц — комиссия 0
+        assert_eq!(deposit_fee(u64::MAX).unwrap(), u64::MAX / 100);
+    }
+
+    #[test]
+    fn vault_state_len_matches_borsh_size() {
+        // 8 байт discriminator + сами поля в Borsh
+        let mut bytes = Vec::new();
+        AnchorSerialize::serialize(&VaultState::default(), &mut bytes).unwrap();
+        assert_eq!(VaultState::LEN, 8 + bytes.len());
+    }
 }

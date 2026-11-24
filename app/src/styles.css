@@ -235,3 +235,54 @@ a {
 footer {
   margin-top: 24px;
 }
+
+/* ─── задания 5–6: кнопки под формами ─── */
+.row-buttons {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-top: 12px;
+}
+
+/* ─── задание 10: история ─── */
+table.history {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 14px;
+  font-variant-numeric: tabular-nums;
+}
+table.history th,
+table.history td {
+  text-align: left;
+  padding: 6px 8px;
+  border-bottom: 1px solid var(--border);
+}
+table.history th {
+  color: var(--muted);
+  font-weight: 500;
+}
+table.history tr.failed td {
+  color: var(--muted);
+}
+table.history .plus {
+  color: var(--ok);
+}
+table.history .minus {
+  color: var(--err);
+}
+
+/* ─── задание 11: панель админа ─── */
+.card.admin {
+  border-color: var(--accent);
+}
+
+/* ─── задание 12: «обновить» в подвале ─── */
+button.link {
+  background: none;
+  border: none;
+  padding: 0;
+  color: var(--accent);
+  font: inherit;
+  cursor: pointer;
+  text-decoration: underline;
+}
